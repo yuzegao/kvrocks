@@ -41,6 +41,10 @@ class ClusterNode {
  public:
   explicit ClusterNode(std::string id, std::string host, int port, int role, std::string master_id,
                        const std::bitset<kClusterSlots> &slots);
+
+  explicit ClusterNode(std::string id, std::string host, int port, int role, std::string master_id,
+                       const std::bitset<kClusterSlots> &slots, std::string lb_ip, int lb_port);
+  
   std::string id;
   std::string host;
   int port;
@@ -49,6 +53,14 @@ class ClusterNode {
   std::bitset<kClusterSlots> slots;
   std::vector<std::string> replicas;
   SlotRange importing_slot_range = {-1, -1};
+  
+  // Load balancer address fields for client
+  std::string lb_ip;      // LB IP address, use real IP if empty
+  int lb_port = 0;        // LB port, use real port if 0
+  
+  // Get IP and port for CLUSTER NODES/SLOTS/REPLICAS command
+  std::string GetNodeIP() const { return lb_ip.empty() ? host : lb_ip; }
+  int GetNodePort() const { return lb_port == 0 ? port : lb_port; }
 };
 
 struct SlotInfo {

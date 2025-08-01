@@ -42,6 +42,12 @@ ClusterNode::ClusterNode(std::string id, std::string host, int port, int role, s
                          const std::bitset<kClusterSlots> &slots)
     : id(std::move(id)), host(std::move(host)), port(port), role(role), master_id(std::move(master_id)), slots(slots) {}
 
+// Constructor with LB address support
+ClusterNode::ClusterNode(std::string id, std::string host, int port, int role, std::string master_id,
+                         const std::bitset<kClusterSlots> &slots, std::string lb_ip, int lb_port)
+    : id(std::move(id)), host(std::move(host)), port(port), role(role), master_id(std::move(master_id)), 
+      slots(slots), lb_ip(std::move(lb_ip)), lb_port(lb_port) {}
+
 Cluster::Cluster(Server *srv, std::vector<std::string> binds, int port)
     : srv_(srv), binds_(std::move(binds)), port_(port) {
   for (auto &slots_node : slots_nodes_) {
@@ -146,7 +152,8 @@ Status Cluster::SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const s
 }
 
 // cluster setnodes $all_nodes_info $version $force
-// one line of $all_nodes: $node_id $host $port $role $master_node_id $slot_range
+// one line of $all_nodes: $node_id $host $port $role $master_node_id $slot_range [$lb_ip $lb_port]
+// If lb_ip and lb_port are provided, they will be used for client, real host:port for internal communication
 Status Cluster::SetClusterNodes(const std::string &nodes_str, int64_t version, bool force) {
   if (version < 0) return {Status::NotOK, errInvalidClusterVersion};
 
@@ -492,11 +499,13 @@ Status Cluster::GetSlotsInfo(std::vector<SlotInfo> *slots_infos) {
 
 SlotInfo Cluster::genSlotNodeInfo(int start, int end, const std::shared_ptr<ClusterNode> &n) {
   std::vector<SlotInfo::NodeInfo> vn;
-  vn.push_back({n->host, n->port, n->id});  // itself
+  // Use LB address for client
+  vn.push_back({n->GetNodeIP(), n->GetNodePort(), n->id});  // itself
 
   for (const auto &id : n->replicas) {  // replicas
     if (nodes_.find(id) == nodes_.end()) continue;
-    vn.push_back({nodes_[id]->host, nodes_[id]->port, nodes_[id]->id});
+    auto replica = nodes_[id];
+    vn.push_back({replica->GetNodeIP(), replica->GetNodePort(), replica->id});
   }
 
   return {start, end, vn};
@@ -541,7 +550,7 @@ StatusOr<std::string> Cluster::GetReplicas(const std::string &node_id) {
     std::string node_str;
     // ID, host, port
     node_str.append(
-        fmt::format("{} {}:{}@{} ", replica_id, replica->host, replica->port, replica->port + kClusterPortIncr));
+        fmt::format("{} {}:{}@{} ", replica_id, replica->GetNodeIP(), replica->GetNodePort(), replica->port + kClusterPortIncr));
 
     // Flags
     node_str.append(fmt::format("slave {} ", node_id));
@@ -567,9 +576,10 @@ std::string Cluster::genNodesDescription() {
   std::string nodes_desc;
   for (const auto &[_, node] : nodes_) {
     std::string node_str;
-    // ID, host, port
+    // ID, host, port - use LB address for Client
     node_str.append(node->id + " ");
-    node_str.append(fmt::format("{}:{}@{} ", node->host, node->port, node->port + kClusterPortIncr));
+    node_str.append(fmt::format("{}:{}@{} ", node->GetNodeIP(), node->GetNodePort(), 
+                                node->GetNodePort() + kClusterPortIncr));
 
     // Flags
     if (node->id == myid_) node_str.append("myself,");
@@ -652,7 +662,7 @@ std::string Cluster::genNodesInfo() const {
     node_str.append("node ");
     // ID
     node_str.append(node->id + " ");
-    // Host + Port
+    // Host + Port (real address for persistence)
     node_str.append(fmt::format("{} {} ", node->host, node->port));
 
     // Role
@@ -662,12 +672,19 @@ std::string Cluster::genNodesInfo() const {
       node_str.append("slave " + node->master_id + " ");
     }
 
-    // Slots
+    // Slots (for master nodes)
     if (node->role == kClusterMaster) {
       auto iter = slots_infos.find(node->id);
       if (iter != slots_infos.end() && !iter->second.empty()) {
-        node_str.append(" " + iter->second);
+        node_str.append(iter->second + " ");
       }
+    }
+
+    // LB address information (if available) - always at the end
+    if (!node->lb_ip.empty() && node->lb_port > 0) {
+      node_str.append(fmt::format("{} {}", node->lb_ip, node->lb_port));
+    } else {
+      node_str.append("- -");  // Placeholder for no LB address
     }
     nodes_info.append(node_str + "\n");
   }
@@ -722,7 +739,61 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
         return {Status::NotOK, errInvalidNodeID};
       }
     } else if (key == "node") {
-      nodes_info.append(parsed->second + "\n");
+      // Convert persistence format to CLUSTERX SETNODES format
+      // Persistence format: $node_id $host $port $role $master_id $slots $lb_ip $lb_port
+      // SETNODES format: $node_id $host $port $role $master_id $slots [$lb_ip $lb_port]
+      std::vector<std::string> fields = util::Split(parsed->second, " ");
+      if (fields.size() >= 5) {
+        // Check if it's a slave node (no slots)
+        bool is_slave = (fields.size() >= 4 && 
+                        (util::EqualICase(fields[3], "slave") || util::EqualICase(fields[3], "replica")));
+        
+        if (is_slave) {
+          // For slave nodes: $node_id $host $port $role $master_id [$lb_ip $lb_port]
+          std::string converted_line = fields[0] + " " + fields[1] + " " + fields[2] + " " + 
+                                     fields[3] + " " + fields[4];
+          
+          // Check if last 2 fields are LB address (fields 5 and 6)
+          if (fields.size() >= 7 && fields[5] != "-" && fields[6] != "-") {
+            converted_line += " " + fields[5] + " " + fields[6];
+          }
+          
+          nodes_info.append(converted_line + "\n");
+        } else {
+          // For master nodes: $node_id $host $port $role $master_id $slots [$lb_ip $lb_port]
+          std::string converted_line = fields[0] + " " + fields[1] + " " + fields[2] + " " + 
+                                     fields[3] + " " + fields[4];
+          
+          // Check if last 2 fields are LB address
+          bool has_lb = false;
+          if (fields.size() >= 7) {
+            // Check if last 2 fields look like IP and port
+            auto potential_lb_port_result = ParseInt<uint16_t>(fields[fields.size() - 1], 10);
+            if (potential_lb_port_result && fields[fields.size() - 2] != "-") {
+              const std::string& potential_ip = fields[fields.size() - 2];
+              if (potential_ip.find('.') != std::string::npos || potential_ip.find(':') != std::string::npos) {
+                has_lb = true;
+              }
+            }
+          }
+          
+          // Add slots information
+          size_t slot_end_idx = has_lb ? fields.size() - 2 : fields.size();
+          for (size_t i = 5; i < slot_end_idx; i++) {
+            converted_line += " " + fields[i];
+          }
+          
+          // Add LB address if present
+          if (has_lb) {
+            converted_line += " " + fields[fields.size() - 2] + " " + fields[fields.size() - 1];
+          }
+          
+          nodes_info.append(converted_line + "\n");
+        }
+      } else {
+        // Old format, use directly
+        nodes_info.append(parsed->second + "\n");
+      }
     } else {
       return {Status::NotOK, fmt::format("unknown key: {}", key)};
     }
@@ -784,20 +855,51 @@ Status Cluster::parseClusterNodes(const std::string &nodes_str, ClusterNodes *no
     }
 
     std::bitset<kClusterSlots> slots;
+    std::string lb_ip;
+    int lb_port = 0;
+    
     if (role == kClusterSlave) {
-      if (fields.size() != 5) {
-        return {Status::ClusterInvalidInfo, errInvalidClusterNodeInfo};
+      // For slave nodes: $node_id $host $port $role $master_id [$lb_ip $lb_port]
+      if (fields.size() == 5) {
+        // No LB address
+      } else if (fields.size() == 7) {
+        // Check if last 2 fields are LB address
+        auto lb_port_result = ParseInt<uint16_t>(fields[6], 10);
+        if (lb_port_result && !fields[5].empty() && fields[5] != "-") {
+          lb_ip = fields[5];
+          lb_port = *lb_port_result;
+        }
       } else {
-        // Create slave node
-        (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots);
-        continue;
+        return {Status::ClusterInvalidInfo, errInvalidClusterNodeInfo};
       }
+      // Create slave node with LB address support
+      (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots, lb_ip, lb_port);
+      continue;
     }
 
-    // 6) slot info
+    // 6) slot info and optional LB address for master nodes
+    // Format: $node_id $host $port $role $master_id $slot_range [$lb_ip $lb_port]
     auto valid_range = NumericRange<int>{0, kClusterSlots - 1};
     const std::regex node_id_regex(R"(\b[a-fA-F0-9]{40}\b)");
-    for (unsigned i = 5; i < fields.size(); i++) {
+    
+    // Check if the last 2 fields might be LB address
+    size_t slot_end_idx = fields.size();
+    if (fields.size() >= 7) {
+      // Check if last 2 fields look like IP and port
+      auto potential_lb_port_result = ParseInt<uint16_t>(fields[fields.size() - 1], 10);
+      if (potential_lb_port_result && !fields[fields.size() - 2].empty() && fields[fields.size() - 2] != "-") {
+        // Try to parse as IP address (basic validation)
+        const std::string& potential_ip = fields[fields.size() - 2];
+        if (potential_ip.find('.') != std::string::npos || potential_ip.find(':') != std::string::npos) {
+          // Looks like an IP address, treat last 2 fields as LB address
+          lb_ip = potential_ip;
+          lb_port = *potential_lb_port_result;
+          slot_end_idx = fields.size() - 2;
+        }
+      }
+    }
+    
+    for (unsigned i = 5; i < slot_end_idx; i++) {
       std::vector<std::string> ranges = util::Split(fields[i], "-");
       if (ranges.size() == 1) {
         if (std::regex_match(fields[i], node_id_regex)) {
@@ -842,8 +944,8 @@ Status Cluster::parseClusterNodes(const std::string &nodes_str, ClusterNodes *no
       }
     }
 
-    // Create master node
-    (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots);
+    // Create master node with LB address support
+    (*nodes)[id] = std::make_shared<ClusterNode>(id, host, port, role, master_id, slots, lb_ip, lb_port);
   }
 
   return Status::OK();
