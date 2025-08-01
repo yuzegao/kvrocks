@@ -601,3 +601,140 @@ func TestClusterReset(t *testing.T) {
 		require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 	})
 }
+
+func TestClusterNodesWithLBAddress(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Set cluster nodes with LB addresses
+	nodesWithLB := "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 master - 0-5000 10.0.0.100 6379\n" +
+		"07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 6379 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 6379"
+
+	result := rdb.Do(ctx, "CLUSTERX", "SETNODES", nodesWithLB, "1")
+	require.NoError(t, result.Err())
+
+	// Verify CLUSTER NODES returns LB addresses
+	nodes := rdb.ClusterNodes(ctx)
+	require.NoError(t, nodes.Err())
+	require.Contains(t, nodes.Val(), "10.0.0.100:6379@16379")
+	require.Contains(t, nodes.Val(), "10.0.0.101:6379@16379")
+	require.NotContains(t, nodes.Val(), "192.168.1.10:6379")
+	require.NotContains(t, nodes.Val(), "192.168.1.11:6379")
+}
+
+func TestClusterSlotsWithLBAddress(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Set cluster nodes with LB addresses
+	nodesWithLB := "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 master - 0-5000 10.0.0.100 6379\n" +
+		"07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 6379 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 6379"
+
+	result := rdb.Do(ctx, "CLUSTERX", "SETNODES", nodesWithLB, "1")
+	require.NoError(t, result.Err())
+
+	// Verify CLUSTER SLOTS returns LB addresses
+	slots := rdb.ClusterSlots(ctx)
+	require.NoError(t, slots.Err())
+
+	slotsInfo := slots.Val()
+	require.Len(t, slotsInfo, 1)
+	require.Equal(t, int64(0), slotsInfo[0].Start)
+	require.Equal(t, int64(5000), slotsInfo[0].End)
+	require.Len(t, slotsInfo[0].Nodes, 2)
+
+	// Check master node uses LB address
+	require.Equal(t, "10.0.0.100:6379", slotsInfo[0].Nodes[0].Addr)
+	// Check replica node uses LB address
+	require.Equal(t, "10.0.0.101:6379", slotsInfo[0].Nodes[1].Addr)
+}
+
+func TestClusterReplicasWithLBAddress(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Set cluster nodes with LB addresses
+	nodesWithLB := "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 master - 0-5000 10.0.0.100 6379\n" +
+		"07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 6379 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 6379\n" +
+		"07c37dfeb235213a872192d90877d0cd55635b92 192.168.1.12 6379 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.102 6379"
+
+	result := rdb.Do(ctx, "CLUSTERX", "SETNODES", nodesWithLB, "1")
+	require.NoError(t, result.Err())
+
+	// Verify CLUSTER REPLICAS returns LB addresses
+	replicas := rdb.Do(ctx, "CLUSTER", "REPLICAS", "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1")
+	require.NoError(t, replicas.Err())
+
+	replicasStr := replicas.Val().(string)
+	require.Contains(t, replicasStr, "10.0.0.101:6379@16379")
+	require.Contains(t, replicasStr, "10.0.0.102:6379@16379")
+	require.NotContains(t, replicasStr, "192.168.1.11:6379")
+	require.NotContains(t, replicasStr, "192.168.1.12:6379")
+}
+
+func TestClusterBackwardCompatibilityWithLBAddress(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Test old format (no LB address) still works
+	oldFormatNodes := "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1 6379 master - 0-5000\n" +
+		"07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1 6380 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1"
+
+	result := rdb.Do(ctx, "CLUSTERX", "SETNODES", oldFormatNodes, "1")
+	require.NoError(t, result.Err())
+
+	// Verify uses original IP addresses
+	nodes := rdb.ClusterNodes(ctx)
+	require.NoError(t, nodes.Err())
+	require.Contains(t, nodes.Val(), "127.0.0.1:6379@16379")
+	require.Contains(t, nodes.Val(), "127.0.0.1:6380@16380")
+}
+
+func TestClusterMixedFormatWithLBAddress(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Test mixed format (some nodes with LB, some without)
+	mixedNodes := "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 master - 0-5000 10.0.0.100 6379\n" +
+		"67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2 192.168.1.11 6379 master - 5001-10000"
+
+	result := rdb.Do(ctx, "CLUSTERX", "SETNODES", mixedNodes, "1")
+	require.NoError(t, result.Err())
+
+	nodes := rdb.ClusterNodes(ctx)
+	require.NoError(t, nodes.Err())
+	// First node should use LB address
+	require.Contains(t, nodes.Val(), "10.0.0.100:6379@16379")
+	// Second node should use real address
+	require.Contains(t, nodes.Val(), "192.168.1.11:6379@16379")
+}

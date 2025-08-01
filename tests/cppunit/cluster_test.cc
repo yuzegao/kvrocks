@@ -422,3 +422,245 @@ TEST_F(ClusterTest, GetReplicas) {
   ASSERT_FALSE(unknown_node.IsOK());
   ASSERT_EQ(unknown_node.Msg(), "Invalid cluster node id");
 }
+
+// Test LB address functionality
+TEST_F(ClusterTest, ClusterNodeLBAddress) {
+  // Test constructor without LB address
+  std::bitset<kClusterSlots> slots;
+  slots.set(0, true);
+  ClusterNode node1("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1", "192.168.1.10", 6379, 
+                   kClusterMaster, "-", slots);
+  
+  ASSERT_EQ(node1.GetNodeIP(), "192.168.1.10");
+  ASSERT_EQ(node1.GetNodePort(), 6379);
+  
+  // Test constructor with LB address
+  ClusterNode node2("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2", "192.168.1.11", 6379, 
+                   kClusterMaster, "-", slots, "10.0.0.100", 6379);
+  
+  ASSERT_EQ(node2.host, "192.168.1.11");  // Real IP
+  ASSERT_EQ(node2.port, 6379);            // Real port
+  ASSERT_EQ(node2.lb_ip, "10.0.0.100");   // LB IP
+  ASSERT_EQ(node2.lb_port, 6379);         // LB port
+  ASSERT_EQ(node2.GetNodeIP(), "10.0.0.100");   // Display LB IP
+  ASSERT_EQ(node2.GetNodePort(), 6379);         // Display LB port
+  
+  // Test empty LB address
+  ClusterNode node3("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa3", "192.168.1.12", 6379, 
+                   kClusterMaster, "-", slots, "", 0);
+  
+  ASSERT_EQ(node3.GetNodeIP(), "192.168.1.12");  // Fallback to real IP
+  ASSERT_EQ(node3.GetNodePort(), 6379);          // Fallback to real port
+}
+
+TEST_F(ClusterTest, ClusterSetNodesWithLBAddress) {
+  Status s;
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"127.0.0.1"}, 3002);
+
+  // Test nodes with LB address at the end
+  const std::string nodes_with_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 "
+      "master - 0-5000 10.0.0.100 6379\n"
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2 192.168.1.11 6379 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 6379";
+  
+  s = cluster.SetClusterNodes(nodes_with_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Test mixed format (some nodes with LB, some without)
+  const std::string mixed_nodes =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 "
+      "master - 0-5000 10.0.0.100 6379\n"
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2 192.168.1.11 6379 "
+      "master - 5001-10000";  // No LB address
+  
+  s = cluster.SetClusterNodes(mixed_nodes, 2, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Test backward compatibility (old format)
+  const std::string old_format_nodes =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1 30002 "
+      "master - 0-5000\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1 30004 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1";
+  
+  s = cluster.SetClusterNodes(old_format_nodes, 3, false);
+  ASSERT_TRUE(s.IsOK());
+}
+
+TEST_F(ClusterTest, ClusterNodesOutputWithLBAddress) {
+  const std::string nodes_with_lb =
+      "07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 30004 "
+      "slave e7d1eecce10fd6bb5eb35b9f99a514335d9ba9ca 10.0.0.101 30004\n"
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 30002 "
+      "master - 5461-10922 10.0.0.100 30002";
+  
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"192.168.1.10"}, 30002);
+  Status s = cluster.SetClusterNodes(nodes_with_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  std::string output_nodes;
+  s = cluster.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Verify output uses LB addresses
+  ASSERT_TRUE(output_nodes.find("10.0.0.100:30002@40002") != std::string::npos);
+  ASSERT_TRUE(output_nodes.find("10.0.0.101:30004@40004") != std::string::npos);
+  
+  // Verify real IPs are not in output
+  ASSERT_TRUE(output_nodes.find("192.168.1.10:30002") == std::string::npos);
+  ASSERT_TRUE(output_nodes.find("192.168.1.11:30004") == std::string::npos);
+}
+
+TEST_F(ClusterTest, ClusterSlotsWithLBAddress) {
+  const std::string nodes_with_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 30002 "
+      "master - 0-5000 10.0.0.100 30002\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 30004 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 30004";
+  
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"192.168.1.10"}, 30002);
+  Status s = cluster.SetClusterNodes(nodes_with_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  std::vector<SlotInfo> slots_info;
+  s = cluster.GetSlotsInfo(&slots_info);
+  ASSERT_TRUE(s.IsOK());
+  
+  ASSERT_EQ(slots_info.size(), 1);
+  ASSERT_EQ(slots_info[0].start, 0);
+  ASSERT_EQ(slots_info[0].end, 5000);
+  ASSERT_EQ(slots_info[0].nodes.size(), 2);
+  
+  // Verify master node uses LB address
+  ASSERT_EQ(slots_info[0].nodes[0].host, "10.0.0.100");
+  ASSERT_EQ(slots_info[0].nodes[0].port, 30002);
+  
+  // Verify replica node uses LB address
+  ASSERT_EQ(slots_info[0].nodes[1].host, "10.0.0.101");
+  ASSERT_EQ(slots_info[0].nodes[1].port, 30004);
+}
+
+TEST_F(ClusterTest, ClusterReplicasWithLBAddress) {
+  const std::string nodes_with_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 30002 "
+      "master - 0-5000 10.0.0.100 30002\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 30004 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 30004\n"
+      "07c37dfeb235213a872192d90877d0cd55635b92 192.168.1.12 30005 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.102 30005";
+  
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"192.168.1.10"}, 30002);
+  Status s = cluster.SetClusterNodes(nodes_with_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  auto replicas_result = cluster.GetReplicas("67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1");
+  ASSERT_TRUE(replicas_result.IsOK());
+  
+  std::string replicas_output = replicas_result.GetValue();
+  
+  // Verify replicas output uses LB addresses
+  ASSERT_TRUE(replicas_output.find("10.0.0.101:30004@40004") != std::string::npos);
+  ASSERT_TRUE(replicas_output.find("10.0.0.102:30005@40005") != std::string::npos);
+  
+  // Verify real IPs are not in output
+  ASSERT_TRUE(replicas_output.find("192.168.1.11:30004") == std::string::npos);
+  ASSERT_TRUE(replicas_output.find("192.168.1.12:30005") == std::string::npos);
+}
+
+TEST_F(ClusterTest, ClusterNodesPersistenceWithLBAddress) {
+  const std::string nodes_with_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 30002 "
+      "master - 0-5000 10.0.0.100 30002\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.11 30004 "
+      "slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 30004";
+  
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"192.168.1.10"}, 30002);
+  Status s = cluster.SetClusterNodes(nodes_with_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Test save to file
+  std::string test_file = "/tmp/test_nodes_lb.conf";
+  s = cluster.DumpClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Create new cluster instance to test loading
+  Cluster cluster2(&server, {"192.168.1.10"}, 30002);
+  s = cluster2.LoadClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Verify loaded node information
+  std::string output_nodes;
+  s = cluster2.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Verify LB addresses are correctly loaded and used
+  ASSERT_TRUE(output_nodes.find("10.0.0.100:30002@40002") != std::string::npos);
+  ASSERT_TRUE(output_nodes.find("10.0.0.101:30004@40004") != std::string::npos);
+  
+  // Clean up test file
+  unlink(test_file.c_str());
+}
+
+TEST_F(ClusterTest, ClusterLBAddressEdgeCases) {
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"127.0.0.1"}, 3002);
+  
+  // Test LB address with "-" placeholder
+  const std::string nodes_with_dash_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 "
+      "master - 0-5000 - -";
+  
+  Status s = cluster.SetClusterNodes(nodes_with_dash_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  std::string output_nodes;
+  s = cluster.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Verify uses real IP when LB address is "-"
+  ASSERT_TRUE(output_nodes.find("192.168.1.10:6379@16379") != std::string::npos);
+  
+  // Test invalid LB port (should be ignored)
+  const std::string nodes_invalid_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2 192.168.1.11 6379 "
+      "master - 5001-10000 10.0.0.100 invalid_port";
+  
+  s = cluster.SetClusterNodes(nodes_invalid_lb, 2, false);
+  ASSERT_TRUE(s.IsOK());  // Should succeed but ignore invalid LB address
+}
