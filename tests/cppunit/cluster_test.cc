@@ -664,3 +664,172 @@ TEST_F(ClusterTest, ClusterLBAddressEdgeCases) {
   s = cluster.SetClusterNodes(nodes_invalid_lb, 2, false);
   ASSERT_TRUE(s.IsOK());  // Should succeed but ignore invalid LB address
 }
+
+TEST_F(ClusterTest, ClusterLoadNodesWithLBPlaceholders) {
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"10.190.28.10"}, 7286);
+  
+  // Test the exact content from the user's nodes.conf that was causing issues
+  // This simulates the scenario where some nodes have LB addresses and some have placeholders
+  const std::string nodes_conf_content = 
+      "version 1754053357\n"
+      "id 3y0gevWYjbWMTY1qdFBMKVq1NacznmP7YKK7ZSkg\n"
+      "node QbuCqB9bFt42CzZjBRxri5eeoKJAuEfy6Vxkc8OE 10.190.28.10 6750 slave dQahioN668Ngs2NkqSdydARzRrgoEW6aXWepF9qH - -\n"
+      "node 0kbzuMZaMdWpalkIyw4dnXnENfd8PcaX1bovRJOW 10.190.28.10 7115 slave 3y0gevWYjbWMTY1qdFBMKVq1NacznmP7YKK7ZSkg - -\n"
+      "node pjE4thqQnktvRMMEoJmTBVZJ90PEjw5Ux3d9NMCu 10.190.28.10 7029 master - 10922-16383 - -\n"
+      "node 3y0gevWYjbWMTY1qdFBMKVq1NacznmP7YKK7ZSkg 10.190.28.10 7286 master - 0-5460 192.168.0.1 9876\n"
+      "node JvOshRjR9Chn0hdSdYzc0OZgpmNxn8ofrmAVhUHr 10.190.28.10 7442 slave pjE4thqQnktvRMMEoJmTBVZJ90PEjw5Ux3d9NMCu - -\n"
+      "node dQahioN668Ngs2NkqSdydARzRrgoEW6aXWepF9qH 10.190.28.10 7153 master - 5461-10921 - -\n";
+  
+  // Write content to a temporary file
+  std::string test_file = "/tmp/test_nodes_with_placeholders.conf";
+  std::ofstream file(test_file);
+  file << nodes_conf_content;
+  file.close();
+  
+  // This should not fail with "Slot is out of range" error
+  Status s = cluster.LoadClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK()) << "LoadClusterNodes failed: " << s.Msg();
+  
+  // Verify that the cluster is properly configured
+  std::string output_nodes;
+  s = cluster.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Verify that the node with LB address uses it for display
+  ASSERT_TRUE(output_nodes.find("192.168.0.1:9876@19876") != std::string::npos);
+  
+  // Verify that nodes without LB address use real IP
+  ASSERT_TRUE(output_nodes.find("10.190.28.10:7029@17029") != std::string::npos);
+  ASSERT_TRUE(output_nodes.find("10.190.28.10:7153@17153") != std::string::npos);
+  
+  // Verify slot assignments are correct
+  std::vector<SlotInfo> slots_info;
+  s = cluster.GetSlotsInfo(&slots_info);
+  ASSERT_TRUE(s.IsOK());
+  ASSERT_EQ(slots_info.size(), 3); // 3 masters
+  
+  // Clean up test file
+  unlink(test_file.c_str());
+}
+
+TEST_F(ClusterTest, ClusterBackwardCompatibilityNodesConf) {
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"127.0.0.1"}, 6379);
+  
+  // Test old format nodes.conf (without LB fields) - should work with new code
+  const std::string old_format_nodes_conf = 
+      "version 1\n"
+      "id 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1\n"
+      "node 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1 6379 master - 0-5000\n"
+      "node 07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1 6380 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1\n";
+  
+  std::string test_file = "/tmp/test_old_format.conf";
+  std::ofstream file(test_file);
+  file << old_format_nodes_conf;
+  file.close();
+  
+  // Should load successfully
+  Status s = cluster.LoadClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK()) << "Failed to load old format: " << s.Msg();
+  
+  std::string output_nodes;
+  s = cluster.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Should use real IPs since no LB address
+  ASSERT_TRUE(output_nodes.find("127.0.0.1:6379@16379") != std::string::npos);
+  ASSERT_TRUE(output_nodes.find("127.0.0.1:6380@16380") != std::string::npos);
+  
+  unlink(test_file.c_str());
+}
+
+TEST_F(ClusterTest, ClusterForwardCompatibilityGeneration) {
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"127.0.0.1"}, 6379);
+  
+  // Set nodes without LB addresses
+  const std::string nodes_no_lb =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 127.0.0.1 6379 master - 0-5000\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 127.0.0.1 6380 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1";
+  
+  Status s = cluster.SetClusterNodes(nodes_no_lb, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Generate nodes.conf and verify it doesn't contain LB placeholders
+  std::string test_file = "/tmp/test_generated.conf";
+  s = cluster.DumpClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Read generated file and check it doesn't contain "- -" placeholders
+  std::ifstream generated_file(test_file);
+  std::string file_content((std::istreambuf_iterator<char>(generated_file)),
+                          std::istreambuf_iterator<char>());
+  generated_file.close();
+  
+  // Should not contain LB placeholders for compatibility
+  ASSERT_TRUE(file_content.find("- -") == std::string::npos);
+  
+  // Should contain the basic node information
+  ASSERT_TRUE(file_content.find("127.0.0.1 6379 master") != std::string::npos);
+  ASSERT_TRUE(file_content.find("127.0.0.1 6380 slave") != std::string::npos);
+  
+  unlink(test_file.c_str());
+}
+
+TEST_F(ClusterTest, ClusterMixedCompatibilityTest) {
+  auto config = storage_->GetConfig();
+  config->workers = 0;
+  Server server(storage_.get(), config);
+  server.Stop();
+  server.Join();
+  
+  Cluster cluster(&server, {"127.0.0.1"}, 6379);
+  
+  // Test mixed scenarios: some nodes with LB, some without
+  const std::string mixed_nodes =
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 192.168.1.10 6379 master - 0-5000 10.0.0.100 6379\n"
+      "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa2 192.168.1.11 6380 master - 5001-10000\n"
+      "07c37dfeb235213a872192d90877d0cd55635b91 192.168.1.12 6381 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.101 6381";
+  
+  Status s = cluster.SetClusterNodes(mixed_nodes, 1, false);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Generate and reload to test round-trip compatibility
+  std::string test_file = "/tmp/test_mixed.conf";
+  s = cluster.DumpClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Create new cluster instance and load
+  Cluster cluster2(&server, {"192.168.1.10"}, 6379);
+  s = cluster2.LoadClusterNodes(test_file);
+  ASSERT_TRUE(s.IsOK());
+  
+  std::string output_nodes;
+  s = cluster2.GetClusterNodes(&output_nodes);
+  ASSERT_TRUE(s.IsOK());
+  
+  // Node with LB should use LB address
+  ASSERT_TRUE(output_nodes.find("10.0.0.100:6379@16379") != std::string::npos);
+  ASSERT_TRUE(output_nodes.find("10.0.0.101:6381@16381") != std::string::npos);
+  
+  // Node without LB should use real address
+  ASSERT_TRUE(output_nodes.find("192.168.1.11:6380@16380") != std::string::npos);
+  
+  unlink(test_file.c_str());
+}

@@ -680,11 +680,10 @@ std::string Cluster::genNodesInfo() const {
       }
     }
 
-    // LB address information (if available) - always at the end
+    // LB address information (only if valid) - for backward compatibility
+    // Don't write placeholder "- -" to ensure old kvrocks can read the file
     if (!node->lb_ip.empty() && node->lb_port > 0) {
-      node_str.append(fmt::format("{} {}", node->lb_ip, node->lb_port));
-    } else {
-      node_str.append("- -");  // Placeholder for no LB address
+      node_str.append(fmt::format(" {} {}", node->lb_ip, node->lb_port));
     }
     nodes_info.append(node_str + "\n");
   }
@@ -753,9 +752,16 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
           std::string converted_line = fields[0] + " " + fields[1] + " " + fields[2] + " " + 
                                      fields[3] + " " + fields[4];
           
-          // Check if last 2 fields are LB address (fields 5 and 6)
-          if (fields.size() >= 7 && fields[5] != "-" && fields[6] != "-") {
-            converted_line += " " + fields[5] + " " + fields[6];
+          if (fields.size() == 5) {
+            // Old format: no LB fields
+          } else if (fields.size() == 7) {
+            // New format: with LB fields, check if they are valid (not placeholders)
+            auto potential_lb_port_result = ParseInt<uint16_t>(fields[6], 10);
+            if (potential_lb_port_result && fields[5] != "-") {
+              // Valid LB address, add it
+              converted_line += " " + fields[5] + " " + fields[6];
+            }
+            // If it's placeholders (- -), we don't add them to maintain compatibility
           }
           
           nodes_info.append(converted_line + "\n");
@@ -764,27 +770,35 @@ Status Cluster::LoadClusterNodes(const std::string &file_path) {
           std::string converted_line = fields[0] + " " + fields[1] + " " + fields[2] + " " + 
                                      fields[3] + " " + fields[4];
           
-          // Check if last 2 fields are LB address
-          bool has_lb = false;
+          // For master: $node_id $host $port $role $master_id $slots... [$lb_ip $lb_port]
+          // Need to handle both old format (no LB) and new format (with LB)
+          bool has_valid_lb = false;
+          size_t slot_end_idx = fields.size();
+          
+          // Check if last 2 fields might be LB address
           if (fields.size() >= 7) {
-            // Check if last 2 fields look like IP and port
             auto potential_lb_port_result = ParseInt<uint16_t>(fields[fields.size() - 1], 10);
-            if (potential_lb_port_result && fields[fields.size() - 2] != "-") {
+            if (potential_lb_port_result) {
               const std::string& potential_ip = fields[fields.size() - 2];
-              if (potential_ip.find('.') != std::string::npos || potential_ip.find(':') != std::string::npos) {
-                has_lb = true;
+              // Check if it looks like an IP (not a slot range)
+              if ((potential_ip.find('.') != std::string::npos || potential_ip.find(':') != std::string::npos) 
+                  && potential_ip != "-") {
+                has_valid_lb = true;
+                slot_end_idx = fields.size() - 2; // Exclude LB fields from slots
+              } else if (potential_ip == "-") {
+                // This is a placeholder, exclude it
+                slot_end_idx = fields.size() - 2;
               }
             }
           }
           
           // Add slots information
-          size_t slot_end_idx = has_lb ? fields.size() - 2 : fields.size();
           for (size_t i = 5; i < slot_end_idx; i++) {
             converted_line += " " + fields[i];
           }
           
           // Add LB address if present
-          if (has_lb) {
+          if (has_valid_lb) {
             converted_line += " " + fields[fields.size() - 2] + " " + fields[fields.size() - 1];
           }
           
