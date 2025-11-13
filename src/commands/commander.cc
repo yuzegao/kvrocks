@@ -27,6 +27,10 @@ namespace redis {
 
 RegisterToCommandTable::RegisterToCommandTable(CommandCategory category,
                                                std::initializer_list<CommandAttributes> list) {
+  if (category == CommandCategory::Disabled) {
+    return;
+  }
+
   for (auto attr : list) {
     attr.category = category;
     CommandTable::redis_command_table.emplace_back(attr);
@@ -99,10 +103,7 @@ StatusOr<std::vector<int>> CommandTable::GetKeysFromCommand(const CommandAttribu
       [&](const std::vector<std::string> &, CommandKeyRange key_range) {
         key_range.ForEachKeyIndex([&](int i) { key_indexes.push_back(i); }, cmd_tokens.size());
       },
-      cmd_tokens,
-      [&](const auto &) {
-        status = {Status::NotOK, "The command has no key arguments"};
-      });
+      cmd_tokens, [&](const auto &) { status = {Status::NotOK, "The command has no key arguments"}; });
 
   if (!status) {
     return status;
