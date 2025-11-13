@@ -74,6 +74,16 @@ struct CommandFunction : Commander {
       }
       auto s = lua::FunctionDelete(ctx, conn, libname);
       if (!s) return s;
+      s = srv->Propagate(engine::kPropagateScriptCommand, args_);
+      if (!s) return s;
+
+      *output = RESP_OK;
+      return Status::OK();
+    } else if (parser.EatEqICase("flush")) {
+      auto s = lua::FunctionFlush(conn, &ctx);
+      if (!s) return s;
+      s = srv->Propagate(engine::kPropagateScriptCommand, args_);
+      if (!s) return s;
 
       *output = RESP_OK;
       return Status::OK();
@@ -110,10 +120,17 @@ uint64_t GenerateFunctionFlags(uint64_t flags, const std::vector<std::string> &a
   return flags;
 }
 
-REDIS_REGISTER_COMMANDS(Function,
-                        MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", NO_KEY,
-                                                     GenerateFunctionFlags),
-                        MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script", GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script", GetScriptEvalKeyRange));
+uint64_t GenerateFCallFlags(uint64_t flags, const std::vector<std::string> &, const Config &config) {
+  if (!config.lua_strict_key_accessing) {
+    return flags | kCmdExclusive;
+  }
+
+  return flags;
+}
+
+REDIS_REGISTER_COMMANDS(
+    Function, MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", NO_KEY, GenerateFunctionFlags),
+    MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script skip-monitor", GetScriptEvalKeyRange, GenerateFCallFlags),
+    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange));
 
 }  // namespace redis

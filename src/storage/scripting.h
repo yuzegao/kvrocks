@@ -39,7 +39,8 @@ inline constexpr const char REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX[] = "__redis_re
 inline constexpr const char REDIS_FUNCTION_LIBNAME[] = "REDIS_FUNCTION_LIBNAME";
 inline constexpr const char REDIS_FUNCTION_NEEDSTORE[] = "REDIS_FUNCTION_NEEDSTORE";
 inline constexpr const char REDIS_FUNCTION_LIBRARIES[] = "REDIS_FUNCTION_LIBRARIES";
-inline constexpr const char REGISTRY_SCRIPT_RUN_CTX_NAME[] = "SCRIPT_RUN_CTX";
+inline constexpr const char REGISTRY_SCRIPT_RUN_CTX_NAME[] = "__SCRIPT_RUN_CTX";
+inline constexpr const char REGISTRY_KEYS_NAME[] = "__CURRENT_KEYS";
 
 namespace lua {
 
@@ -70,7 +71,7 @@ Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const s
 bool ScriptExists(lua_State *lua, const std::string &sha);
 
 Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::string &script, bool need_to_store,
-                    bool replace, std::string *lib_name, bool read_only = false);
+                    bool replace, std::string *lib_name);
 Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::string &name,
                     const std::vector<std::string> &keys, const std::vector<std::string> &argv, std::string *output,
                     bool read_only = false);
@@ -81,7 +82,8 @@ Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Cont
 Status FunctionListLib(redis::Connection *conn, const std::string &libname, std::string *output);
 Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::string &name);
 bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std::string &libname,
-                        bool need_check_storage = true, bool read_only = false);
+                        bool need_check_storage = true);
+Status FunctionFlush(redis::Connection *conn, engine::Context *ctx);
 
 const char *RedisProtocolToLuaType(lua_State *lua, const char *reply);
 const char *RedisProtocolToLuaTypeInt(lua_State *lua, const char *reply);
@@ -164,7 +166,7 @@ template <typename T>
 void SaveOnRegistry(lua_State *lua, const char *name, T *ptr) {
   lua_pushstring(lua, name);
   if (ptr) {
-    lua_pushlightuserdata(lua, ptr);
+    lua_pushlightuserdata(lua, (void *)ptr);
   } else {
     lua_pushnil(lua);
   }

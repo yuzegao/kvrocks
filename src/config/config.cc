@@ -125,8 +125,7 @@ Status SetRocksdbCompression(Server *srv, const rocksdb::CompressionType compres
   for (size_t i = compression_start_level; i < KVROCKS_MAX_LSM_LEVEL; i++) {
     compression_per_level_builder.emplace_back(compression_option);
   }
-  const std::string compression_per_level = util::StringJoin(
-      compression_per_level_builder, [](const auto &s) -> decltype(auto) { return s; }, ":");
+  const std::string compression_per_level = util::StringJoin(compression_per_level_builder, ":");
   return srv->storage->SetOptionForAllColumnFamilies("compression_per_level", compression_per_level);
 };
 
@@ -203,6 +202,8 @@ Config::Config() {
       {"slave-read-only", false, new YesNoField(&slave_readonly, true)},
       {"replication-connect-timeout-ms", false, new IntField(&replication_connect_timeout_ms, 3100, 0, INT_MAX)},
       {"replication-recv-timeout-ms", false, new IntField(&replication_recv_timeout_ms, 3200, 0, INT_MAX)},
+      {"replication-group-sync", false, new YesNoField(&replication_group_sync, false)},
+      {"replication-no-slowdown", false, new YesNoField(&replication_no_slowdown, true)},
       {"replication-delay-bytes", false, new IntField(&max_replication_delay_bytes, 16 * 1024, 1, INT_MAX)},
       {"replication-delay-updates", false, new IntField(&max_replication_delay_updates, 16, 1, INT_MAX)},
       {"use-rsid-psync", true, new YesNoField(&use_rsid_psync, false)},
@@ -218,7 +219,6 @@ Config::Config() {
                                                 spdlog::level::off)},
       {"purge-backup-on-fullsync", false, new YesNoField(&purge_backup_on_fullsync, false)},
       {"rename-command", true, new MultiStringField(&rename_command_, std::vector<std::string>{})},
-      {"auto-resize-block-and-sst", false, new YesNoField(&auto_resize_block_and_sst, true)},
       {"fullsync-recv-file-delay", false, new IntField(&fullsync_recv_file_delay, 0, 0, INT_MAX)},
       {"cluster-enabled", true, new YesNoField(&cluster_enabled, false)},
       {"migrate-speed", false, new IntField(&migrate_speed, 4096, 0, INT_MAX)},
@@ -227,7 +227,7 @@ Config::Config() {
       {"migrate-type", false,
        new EnumField<MigrationType>(&migrate_type, migration_types, MigrationType::kRawKeyValue)},
       {"migrate-batch-size-kb", false, new IntField(&migrate_batch_size_kb, 16, 1, INT_MAX)},
-      {"migrate-batch-rate-limit-mb", false, new IntField(&migrate_batch_rate_limit_mb, 16, 0, INT_MAX)},
+      {"migrate-batch-rate-limit-mb", false, new IntField(&migrate_batch_rate_limit_mb, 16, 1, INT_MAX)},
       {"unixsocket", true, new StringField(&unixsocket, "")},
       {"unixsocketperm", true, new OctalField(&unixsocketperm, 0777, 1, INT_MAX)},
       {"log-retention-days", true, new IntField(&log_retention_days, -1, -1, INT_MAX)},
@@ -243,6 +243,7 @@ Config::Config() {
       {"txn-context-enabled", true, new YesNoField(&txn_context_enabled, false)},
       {"skip-block-cache-deallocation-on-close", false, new YesNoField(&skip_block_cache_deallocation_on_close, false)},
       {"histogram-bucket-boundaries", true, new StringField(&histogram_bucket_boundaries_str_, "")},
+      {"lua-strict-key-accessing", false, new YesNoField(&lua_strict_key_accessing, false)},
 
       /* rocksdb options */
       {"rocksdb.compression", false,
@@ -298,7 +299,7 @@ Config::Config() {
       {"rocksdb.max_bytes_for_level_multiplier", false,
        new IntField(&rocks_db.max_bytes_for_level_multiplier, 10, 1, 100)},
       {"rocksdb.level_compaction_dynamic_level_bytes", false,
-       new YesNoField(&rocks_db.level_compaction_dynamic_level_bytes, false)},
+       new YesNoField(&rocks_db.level_compaction_dynamic_level_bytes, true)},
       {"rocksdb.max_background_jobs", false, new IntField(&rocks_db.max_background_jobs, 4, 0, 32)},
       {"rocksdb.rate_limiter_auto_tuned", true, new YesNoField(&rocks_db.rate_limiter_auto_tuned, true)},
       {"rocksdb.avoid_unnecessary_blocking_io", true, new YesNoField(&rocks_db.avoid_unnecessary_blocking_io, true)},
@@ -306,6 +307,10 @@ Config::Config() {
       {"rocksdb.max_compaction_bytes", false, new Int64Field(&rocks_db.max_compaction_bytes, 0, 0, INT64_MAX)},
       {"rocksdb.sst_file_delete_rate_bytes_per_sec", false,
        new Int64Field(&rocks_db.sst_file_delete_rate_bytes_per_sec, 0, 0, INT64_MAX)},
+      {"rocksdb.periodic_compaction_seconds", false,
+       new UInt64Field(&rocks_db.periodic_compaction_seconds, kDefaultRocksdbPeriodicCompactionSeconds, 0, UINT64_MAX)},
+      {"rocksdb.ttl", false, new UInt64Field(&rocks_db.ttl, kDefaultRocksdbTTL, 0, UINT64_MAX)},
+      {"rocksdb.daily_offpeak_time_utc", false, new StringField(&rocks_db.daily_offpeak_time_utc, "")},
 
       /* rocksdb write options */
       {"rocksdb.write_options.sync", true, new YesNoField(&rocks_db.write_options.sync, false)},
@@ -731,6 +736,9 @@ void Config::initFieldCallback() {
              srv->storage->SetSstFileDeleteRateBytesPerSecond(rocks_db.sst_file_delete_rate_bytes_per_sec);
              return Status::OK();
            }},
+          {"rocksdb.periodic_compaction_seconds", set_cf_option_cb},
+          {"rocksdb.ttl", set_cf_option_cb},
+          {"rocksdb.daily_offpeak_time_utc", set_db_option_cb},
           {"rocksdb.level0_slowdown_writes_trigger",
            [this, &set_cf_option_cb](Server *srv, const std::string &k,
                                      [[maybe_unused]] const std::string &v) -> Status {

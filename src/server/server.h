@@ -203,6 +203,7 @@ class Server {
   void CleanupExitedSlaves();
   bool IsSlave() const { return !master_host_.empty(); }
   void FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens);
+  static std::vector<std::string> RedactSensitiveTokens(const std::vector<std::string> &tokens);
   void IncrFetchFileThread() { fetch_file_threads_num_++; }
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
   int GetFetchFileThreadNum() const { return fetch_file_threads_num_; }
@@ -234,15 +235,17 @@ class Server {
   void BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target_seq, uint64_t num_replicas);
   void WakeupWaitConnections(rocksdb::SequenceNumber seq);
   void CleanupWaitConnection(redis::Connection *conn);
+  void WakeupWaitConnection(redis::Connection *conn, rocksdb::SequenceNumber seq);
 
   // Helper methods for WAIT command
   size_t GetReplicasReachedSequence(rocksdb::SequenceNumber target_seq);
+  // Return the largest wait_context.target_seq that can wakeup given the seq.
+  // If no wait_context can wakeup, return 0.
+  rocksdb::SequenceNumber LargestTargetSeqToWakeup(rocksdb::SequenceNumber seq);
 
   size_t GetReplicaCount() {
-    slave_threads_mu_.lock();
-    auto replica_count = slave_threads_.size();
-    slave_threads_mu_.unlock();
-    return replica_count;
+    std::shared_lock<std::shared_mutex> guard(slave_threads_mu_);
+    return slave_threads_.size();
   }
 
   std::string GetLastRandomKeyCursor();
@@ -287,7 +290,7 @@ class Server {
   Status AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours);
   Status AsyncScanDBSize(const std::string &ns);
   void GetLatestKeyNumStats(const std::string &ns, KeyNumStats *stats);
-  int64_t GetLastScanTime(const std::string &ns) const;
+  int64_t GetLastScanTime(const std::string &ns);
   StatusOr<std::vector<rocksdb::BatchResult>> PollUpdates(uint64_t next_sequence, int64_t count, bool is_strict) const;
 
   std::string GenerateCursorFromKeyName(const std::string &key_name, CursorType cursor_type, const char *prefix = "");
@@ -317,7 +320,6 @@ class Server {
 
   Status Propagate(const std::string &channel, const std::vector<std::string> &tokens) const;
   Status ExecPropagatedCommand(const std::vector<std::string> &tokens);
-  Status ExecPropagateScriptCommand(const std::vector<std::string> &tokens);
 
   LogCollector<PerfEntry> *GetPerfLog() { return &perf_log_; }
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
@@ -356,12 +358,14 @@ class Server {
   void cron();
   void recordInstantaneousMetrics();
   static void updateCachedTime();
-  Status autoResizeBlockAndSST();
   void updateWatchedKeysFromRange(const std::vector<std::string> &args, const redis::CommandKeyRange &range);
   void updateAllWatchedKeys();
   void increaseWorkerThreads(size_t delta);
   void decreaseWorkerThreads(size_t delta);
   void cleanupExitedWorkerThreads(bool force);
+  // Helper function to clean up wait contexts for a given connection
+  // It would not hold the wait_contexts_mu_ and the caller should hold it.
+  void cleanupWaitConnection(redis::Connection *conn);
 
   std::atomic<bool> stop_ = false;
   std::atomic<bool> is_loading_ = false;
@@ -380,7 +384,7 @@ class Server {
   std::atomic<uint64_t> total_clients_{0};
 
   // slave
-  std::mutex slave_threads_mu_;
+  std::shared_mutex slave_threads_mu_;
   std::list<std::unique_ptr<FeedSlaveThread>> slave_threads_;
   std::atomic<int> fetch_file_threads_num_ = 0;
 
@@ -422,8 +426,8 @@ class Server {
     WaitContext(redis::Connection *c, rocksdb::SequenceNumber seq, uint64_t replicas)
         : conn(c), target_seq(seq), num_replicas(replicas) {}
   };
-  std::list<WaitContext> wait_contexts_;
-  std::mutex wait_contexts_mu_;
+  std::multimap<rocksdb::SequenceNumber, WaitContext> wait_contexts_;
+  std::shared_mutex wait_contexts_mu_;
 
   // threads
   std::shared_mutex works_concurrency_rw_lock_;

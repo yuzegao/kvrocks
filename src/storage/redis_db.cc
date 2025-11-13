@@ -183,7 +183,7 @@ rocksdb::Status Database::MDel(engine::Context &ctx, const std::vector<Slice> &k
 
   std::vector<rocksdb::Status> statuses(slice_keys.size());
   std::vector<rocksdb::PinnableSlice> pin_values(slice_keys.size());
-  storage_->MultiGet(ctx, ctx.GetReadOptions(), metadata_cf_handle_, slice_keys.size(), slice_keys.data(),
+  storage_->MultiGet(ctx, ctx.DefaultMultiGetOptions(), metadata_cf_handle_, slice_keys.size(), slice_keys.data(),
                      pin_values.data(), statuses.data());
 
   for (size_t i = 0; i < slice_keys.size(); i++) {
@@ -317,7 +317,8 @@ rocksdb::Status Database::Keys(engine::Context &ctx, const std::string &prefix, 
 
 rocksdb::Status Database::Scan(engine::Context &ctx, const std::string &cursor, uint64_t limit,
                                const std::string &prefix, const std::string &suffix_glob,
-                               std::vector<std::string> *keys, std::string *end_cursor, RedisType type) {
+                               std::vector<std::string> *keys, std::string *end_cursor, RedisType type,
+                               std::optional<int> scan_slot) {
   end_cursor->clear();
   uint64_t cnt = 0;
   uint16_t slot_start = 0;
@@ -328,7 +329,11 @@ rocksdb::Status Database::Scan(engine::Context &ctx, const std::string &cursor, 
 
   std::string ns_cursor = AppendNamespacePrefix(cursor);
   if (storage_->IsSlotIdEncoded()) {
-    slot_start = cursor.empty() ? 0 : GetSlotIdFromKey(cursor);
+    if (scan_slot.has_value()) {
+      slot_start = scan_slot.value();
+    } else {
+      slot_start = cursor.empty() ? 0 : GetSlotIdFromKey(cursor);
+    }
     ns_prefix = ComposeNamespaceKey(namespace_, "", false);
     if (!prefix.empty()) {
       PutFixed16(&ns_prefix, slot_start);
@@ -339,9 +344,14 @@ rocksdb::Status Database::Scan(engine::Context &ctx, const std::string &cursor, 
   }
 
   if (!cursor.empty()) {
-    iter->Seek(ns_cursor);
-    if (iter->Valid()) {
-      iter->Next();
+    if (storage_->IsSlotIdEncoded() && !ns_prefix.empty() &&
+        metadata_cf_handle_->GetComparator()->Compare(rocksdb::Slice(ns_prefix), rocksdb::Slice(ns_cursor)) > 0) {
+      iter->Seek(ns_prefix);
+    } else {
+      iter->Seek(ns_cursor);
+      if (iter->Valid()) {
+        iter->Next();
+      }
     }
   } else if (ns_prefix.empty()) {
     iter->SeekToFirst();
@@ -387,7 +397,7 @@ rocksdb::Status Database::Scan(engine::Context &ctx, const std::string &cursor, 
       break;
     }
 
-    if (++slot_id >= HASH_SLOTS_SIZE) {
+    if (++slot_id >= HASH_SLOTS_SIZE || scan_slot.has_value()) {
       break;
     }
 

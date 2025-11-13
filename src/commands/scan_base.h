@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include "cluster/redis_slot.h"
 #include "commander.h"
 #include "commands/command_parser.h"
 #include "error_constants.h"
@@ -51,6 +52,9 @@ class CommandScanBase : public Commander {
           return {Status::RedisParseErr, "Invalid glob pattern: " + s.Msg()};
         }
         std::tie(prefix_, suffix_glob_) = util::SplitGlob(glob_pattern);
+        if (std::string_view tag = GetTagFromKey(glob_pattern); !tag.empty()) {
+          scan_slot_ = GetSlotIdFromKey(glob_pattern);
+        }
       } else if (parser.EatEqICase("count")) {
         limit_ = GET_OR_RET(parser.TakeInt());
         if (limit_ <= 0) {
@@ -64,6 +68,8 @@ class CommandScanBase : public Commander {
         } else {
           return {Status::RedisExecErr, "Invalid type"};
         }
+      } else if (parser.EatEqICase("novalues")) {
+        no_values_ = true;
       } else {
         return parser.InvalidSyntax();
       }
@@ -102,6 +108,8 @@ class CommandScanBase : public Commander {
   std::string suffix_glob_ = "*";
   int limit_ = 20;
   RedisType type_ = kRedisNone;
+  bool no_values_ = false;
+  std::optional<int> scan_slot_;
 };
 
 class CommandSubkeyScanBase : public CommandScanBase {

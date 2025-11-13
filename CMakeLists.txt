@@ -33,7 +33,6 @@ option(ENABLE_OPENSSL "enable openssl to support tls connection" OFF)
 option(ENABLE_LTO "enable link-time optimization" ON)
 set(SYMBOLIZE_BACKEND "" CACHE STRING "symbolization backend library for cpptrace (libbacktrace, libdwarf, or empty)")
 set(PORTABLE 0 CACHE STRING "build a portable binary (disable arch-specific optimizations)")
-# TODO: set ENABLE_NEW_ENCODING to ON when we are ready
 option(ENABLE_NEW_ENCODING "enable new encoding (#1033) for storing 64bit size and expire time in milliseconds" ON)
 
 # to save build time in debug mode
@@ -74,8 +73,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(DEPS_FETCH_PROXY "" CACHE STRING
-    "a template URL to proxy the traffic for fetching dependencies, e.g. with DEPS_FETCH_PROXY = https://some-proxy/,
+    "a template URL to proxy the traffic for fetching dependencies,
+     e.g. with DEPS_FETCH_PROXY = https://some-proxy/,
      https://example/some-dep.zip -> https://some-proxy/https://example/some-dep.zip")
+set(DEPS_FETCH_DIR "" CACHE PATH
+    "if specified, dependencies will be downloaded into this directory first,
+     and reused in subsequent builds")
 
 if(ENABLE_ASAN AND ENABLE_TSAN)
     message(FATAL_ERROR "ASan and TSan cannot be used at the same time")
@@ -153,6 +156,24 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "do not build shared libs by default")
 
 if(ENABLE_OPENSSL)
     find_package(OpenSSL REQUIRED)
+endif()
+
+# Auto-detect macOS SDK path if not set
+if(APPLE AND NOT CMAKE_OSX_SYSROOT)
+  execute_process(
+    COMMAND xcrun --sdk macosx --show-sdk-path
+    OUTPUT_VARIABLE MACOS_SDK_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE result
+  )
+
+  if(result EQUAL 0 AND EXISTS "${MACOS_SDK_PATH}")
+    set(CMAKE_OSX_SYSROOT "${MACOS_SDK_PATH}" CACHE PATH "macOS SDK path" FORCE)
+  else()
+    message(FATAL_ERROR "Failed to detect macOS SDK path. "
+            "Install Xcode command line tools or set CMAKE_OSX_SYSROOT manually.")
+  endif()
 endif()
 
 include(cmake/gtest.cmake)

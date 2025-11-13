@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"testing"
 	"time"
 
@@ -231,5 +232,80 @@ func TestSearch(t *testing.T) {
 		require.Equal(t, 3, len(res.Val().([]interface{})))
 		require.Equal(t, int64(1), res.Val().([]interface{})[0])
 		require.Equal(t, "test_expired:k3", res.Val().([]interface{})[1])
+	})
+}
+
+func TestSearchTag(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("FT.SEARCH with number literal tags", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "FT.CREATE", "testidx_number", "ON", "HASH", "PREFIX", "1", "testidx_number:", "SCHEMA", "a", "TAG").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_number:k1", "a", "3.1415926").Err())
+
+		res := rdb.Do(ctx, "FT.SEARCH", "testidx_number", `@a:{3.1415926}`)
+		require.NoError(t, res.Err())
+		// result should be [1 testidx_number:k1 [a 3.1415926]]
+		require.Equal(t, 3, len(res.Val().([]interface{})))
+		require.Equal(t, int64(1), res.Val().([]interface{})[0])
+		require.Equal(t, "testidx_number:k1", res.Val().([]interface{})[1])
+	})
+
+	t.Run("FT.SEARCH with escaped characters in tags", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "FT.CREATE", "testidx_escape", "ON", "HASH", "PREFIX", "1", "testidx_escape:", "SCHEMA", "a", "TAG").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_escape:k1", "a", "email@example.com").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_escape:k2", "a", "Hello World").Err())
+
+		res := rdb.Do(ctx, "FT.SEARCH", "testidx_escape", `@a:{email\@example\.com}`)
+		require.NoError(t, res.Err())
+		// result should be [1 testidx_escape:k1 [a email@example.com]]
+		require.Equal(t, 3, len(res.Val().([]interface{})))
+		require.Equal(t, int64(1), res.Val().([]interface{})[0])
+		require.Equal(t, "testidx_escape:k1", res.Val().([]interface{})[1])
+
+		res = rdb.Do(ctx, "FT.SEARCH", "testidx_escape", `@a:{Hello\ World}`)
+		require.NoError(t, res.Err())
+		// result should be [1 testidx_escape:k2 [b Hello World]]
+		require.Equal(t, 3, len(res.Val().([]interface{})))
+		require.Equal(t, int64(1), res.Val().([]interface{})[0])
+		require.Equal(t, "testidx_escape:k2", res.Val().([]interface{})[1])
+	})
+
+	t.Run("FT.SEARCH with case insensitive tags", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "FT.CREATE", "testidx_case_insensitive", "ON", "HASH", "PREFIX", "1", "testidx_case_insensitive:", "SCHEMA", "a", "TAG").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_case_insensitive:k1", "a", "Aa").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_case_insensitive:k2", "a", "Ab").Err())
+
+		res := rdb.Do(ctx, "FT.SEARCH", "testidx_case_insensitive", `@a:{Ab}`)
+		require.NoError(t, res.Err())
+		// result should be [1 testidx_case_insensitive:k2 [a Ab]]
+		require.Equal(t, 3, len(res.Val().([]interface{})))
+		require.Equal(t, int64(1), res.Val().([]interface{})[0])
+		require.Equal(t, "testidx_case_insensitive:k2", res.Val().([]interface{})[1])
+	})
+}
+
+func TestSearchNumeric(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("FT.SEARCH reverse scan DBL_MAX", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "FT.CREATE", "testidx_dbl_max", "ON", "HASH", "PREFIX", "1", "testidx_dbl_max:", "SCHEMA", "a", "NUMERIC").Err())
+		require.NoError(t, rdb.Do(ctx, "HSET", "testidx_dbl_max:k1", "a", math.MaxFloat64).Err())
+
+		res := rdb.Do(ctx, "FT.SEARCH", "testidx_dbl_max", "*", "SORTBY", "a", "DESC")
+		require.NoError(t, res.Err())
+		// result should be [1 testidx_dbl_max:k1 [a 1.7976931348623157e+308]]
+		require.Equal(t, 3, len(res.Val().([]interface{})))
+		require.Equal(t, int64(1), res.Val().([]interface{})[0])
+		require.Equal(t, "testidx_dbl_max:k1", res.Val().([]interface{})[1])
 	})
 }

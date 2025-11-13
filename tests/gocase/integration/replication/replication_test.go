@@ -622,3 +622,92 @@ func TestSlaveLostMaster(t *testing.T) {
 	duration := time.Since(start)
 	require.Less(t, duration, time.Second*6)
 }
+
+func TestReplicationGroupSyncConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	master := util.StartServer(t, map[string]string{})
+	defer master.Close()
+	masterClient := master.NewClient()
+	defer func() { require.NoError(t, masterClient.Close()) }()
+
+	slave := util.StartServer(t, map[string]string{
+		"replication-group-sync":     "yes",
+		"rocksdb.write_options.sync": "yes",
+	})
+	defer slave.Close()
+	slaveClient := slave.NewClient()
+	defer func() { require.NoError(t, slaveClient.Close()) }()
+
+	t.Run("Replication should work with replication-group-sync enabled", func(t *testing.T) {
+		util.SlaveOf(t, slaveClient, master)
+		util.WaitForSync(t, slaveClient)
+		require.Equal(t, "slave", util.FindInfoEntry(slaveClient, "role"))
+
+		require.NoError(t, masterClient.Set(ctx, "key1", "value1", 0).Err())
+		util.WaitForOffsetSync(t, masterClient, slaveClient, 5*time.Second)
+		require.Equal(t, "value1", slaveClient.Get(ctx, "key1").Val())
+	})
+
+	// Test with replication-group-sync disabled
+	slave2 := util.StartServer(t, map[string]string{
+		"replication-group-sync": "no",
+	})
+	defer slave2.Close()
+	slaveClient2 := slave2.NewClient()
+	defer func() { require.NoError(t, slaveClient2.Close()) }()
+
+	t.Run("Replication should work with replication-group-sync disabled", func(t *testing.T) {
+		util.SlaveOf(t, slaveClient2, master)
+		util.WaitForSync(t, slaveClient2)
+		require.Equal(t, "slave", util.FindInfoEntry(slaveClient2, "role"))
+
+		require.NoError(t, masterClient.Set(ctx, "key2", "value2", 0).Err())
+		util.WaitForOffsetSync(t, masterClient, slaveClient2, 5*time.Second)
+		require.Equal(t, "value2", slaveClient2.Get(ctx, "key2").Val())
+	})
+}
+
+func TestReplicationWatermark(t *testing.T) {
+	t.Parallel()
+	master := util.StartServer(t, map[string]string{})
+	defer master.Close()
+	masterClient := master.NewClient()
+	defer func() { require.NoError(t, masterClient.Close()) }()
+
+	slave := util.StartServer(t, map[string]string{})
+	defer slave.Close()
+	slaveClient := slave.NewClient()
+	defer func() { require.NoError(t, slaveClient.Close()) }()
+
+	ctx := context.Background()
+	util.SlaveOf(t, slaveClient, master)
+	util.WaitForSync(t, slaveClient)
+
+	// Send a large SET command to trigger a high watermark in the slave
+	largeValue := strings.Repeat("a", 16*1024) // 16KB value
+	require.NoError(t, masterClient.Set(ctx, "large_key", largeValue, 0).Err())
+
+	// Wait a bit for the large command to be processed
+	time.Sleep(50 * time.Millisecond)
+
+	// Immediately send a small SET command
+	// Without the fix, this would be delayed due to the high watermark
+	start := time.Now()
+	require.NoError(t, masterClient.Set(ctx, "small_key", "small_value", 0).Err())
+
+	// Check if the small SET is processed quickly on the slave
+	// The small command should appear within 1 second (much faster than the buggy 1 minute delay)
+	require.Eventually(t, func() bool {
+		val, err := slaveClient.Get(ctx, "small_key").Result()
+		if err != nil {
+			return false
+		}
+		return val == "small_value"
+	}, 1*time.Second, 50*time.Millisecond, "slave should process small command quickly after large command")
+
+	duration := time.Since(start)
+	// The small command should be processed much faster than 1 second
+	require.Less(t, duration, 1*time.Second, "small command should be processed promptly")
+}

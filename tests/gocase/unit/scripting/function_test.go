@@ -289,6 +289,31 @@ var testFunctions = func(t *testing.T, config util.KvrocksServerConfigs) {
 			Name: "mylib3", Engine: "lua", Functions: []interface{}{"myget", "myset"},
 		}, decodeListLibResult(t, r))
 	})
+
+	t.Run("FUNCTION DELETE from multiple clients", func(t *testing.T) {
+		// we expect that rdb2 is accepted from another server thread,
+		// but it may not (and that's fine)
+		rdb2 := srv.NewClient()
+		defer func() { require.NoError(t, rdb2.Close()) }()
+
+		require.Equal(t, rdb.Do(ctx, "FCALL", "reverse", 0, "abc").Val(), "cba")
+
+		require.NoError(t, rdb2.Do(ctx, "FUNCTION", "DELETE", "mylib1").Err())
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "reverse", 0, "abc").Err(), ".*No such function name.*")
+		util.ErrorRegexp(t, rdb2.Do(ctx, "FCALL", "reverse", 0, "abc").Err(), ".*No such function name.*")
+
+		require.NoError(t, rdb.Do(ctx, "FCALL", "myset", 1, "func-test-tmp-a", 123).Err())
+		require.Equal(t, rdb2.Do(ctx, "FCALL", "myget", 1, "func-test-tmp-a").Val(), "123")
+	})
+
+	t.Run("FUNCTION FLUSH", func(t *testing.T) {
+		require.NoError(t, rdb.Do(ctx, "FUNCTION", "FLUSH").Err())
+
+		// After flush, all functions should be gone
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "inc", 0, 1).Err(), ".*No such function name.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "hello", 0, "x").Err(), ".*No such function name.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "myget", 1, "func-test-tmp-b").Err(), ".*No such function name.*")
+	})
 }
 
 func TestFunctionScriptFlags(t *testing.T) {
@@ -554,5 +579,39 @@ func TestFunctionScriptFlags(t *testing.T) {
 		util.ErrorRegexp(t, r.Err(), "ERR .* Write commands are not allowed from read-only scripts")
 		r = rdb0.Do(ctx, "FCALL", "no_write_allow_cross_func_3", 0)
 		util.ErrorRegexp(t, r.Err(), "ERR .* Script attempted to access a non local key in a cluster node script")
+	})
+}
+
+func TestFunctionInStrictMode(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("Accessing undeclared keys in strict mode", func(t *testing.T) {
+		rdb.FunctionLoad(ctx, `#!lua name=tmplib
+			redis.register_function('set1', function(keys, args)
+				return redis.call('set', keys[1], args[1])
+			end)
+			redis.register_function('set2', function(keys, args)
+				return redis.call('set', args[1], args[2])
+			end)
+		`)
+
+		rdb.ConfigSet(ctx, "lua-strict-key-accessing", "yes")
+
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "set2", 0, "x", "1").Err(), ".*'x'.*not in the allowed keys.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "FCALL", "set2", 1, "y", "x", "1").Err(), ".*'x'.*not in the allowed keys.*")
+
+		require.NoError(t, rdb.Do(ctx, "FCALL", "set2", 1, "x", "x", "1").Err())
+		require.NoError(t, rdb.Do(ctx, "FCALL", "set2", 2, "x", "y", "x", "1").Err())
+		require.NoError(t, rdb.Do(ctx, "FCALL", "set1", 1, "x", "1").Err())
+
+		rdb.ConfigSet(ctx, "lua-strict-key-accessing", "no")
+
+		require.NoError(t, rdb.Do(ctx, "FCALL", "set2", 0, "x", "1").Err())
+		require.NoError(t, rdb.Do(ctx, "FCALL", "set1", 1, "x", "1").Err())
 	})
 }

@@ -431,7 +431,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
 
-    auto cmd_flags = attributes->GenerateFlags(cmd_tokens);
+    auto cmd_flags = attributes->GenerateFlags(cmd_tokens, *config);
     if (GetNamespace().empty()) {
       if (!password.empty()) {
         if (!(cmd_flags & kCmdAuth)) {
@@ -573,7 +573,9 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       }
     }
 
-    srv_->FeedMonitorConns(this, cmd_tokens);
+    if (!(cmd_flags & redis::kCmdSkipMonitor)) {
+      srv_->FeedMonitorConns(this, cmd_tokens);
+    }
 
     // Break the execution loop when occurring the blocking command like BLPOP or BRPOP,
     // it will suspend the connection and wait for the wakeup signal.

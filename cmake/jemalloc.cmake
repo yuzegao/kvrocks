@@ -32,7 +32,7 @@ endif()
 include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirror(jemalloc
-  jemalloc/jemalloc 5.3.0  
+  facebook/jemalloc 5.3.0
   SHA1=1be8fdba021e9d6ed201e7d6a3c464b2223fc927
 )
 
@@ -43,7 +43,7 @@ if(NOT jemalloc_POPULATED)
   execute_process(COMMAND autoconf
     WORKING_DIRECTORY ${jemalloc_SOURCE_DIR}
   )
-  execute_process(COMMAND ${jemalloc_SOURCE_DIR}/configure CC=${CMAKE_C_COMPILER} -C --enable-autogen
+  execute_process(COMMAND ${jemalloc_SOURCE_DIR}/configure CC=${CMAKE_C_COMPILER} -C ${JEMALLOC_CROSS_FLAGS} --enable-autogen
                     --disable-shared --disable-libdl ${DISABLE_CACHE_OBLIVIOUS} ${ENABLE_JEMALLOC_PROFILING}
                     --with-jemalloc-prefix=""
     WORKING_DIRECTORY ${jemalloc_BINARY_DIR}
