@@ -153,7 +153,22 @@ class CommandClusterX : public Commander {
     if (subcommand_ == "setnodeid" && args_.size() == 3 && args_[2].size() == kClusterNodeIdLen) return Status::OK();
 
     if (subcommand_ == "migrate") {
-      if (args.size() < 4 || args.size() > 6) return {Status::RedisParseErr, errWrongNumOfArguments};
+      // Handle DTS actions: dtscomplete, dtscancel
+      if (args.size() == 3) {
+        auto action = util::ToLower(args[2]);
+        if (action == "dtscomplete") {
+          migrate_action_ = MigrateAction::kDTSComplete;
+          return Status::OK();
+        } else if (action == "dtscancel") {
+          migrate_action_ = MigrateAction::kDTSCancel;
+          return Status::OK();
+        }
+        // If not DTS actions, fall through to normal parsing
+      }
+
+      if (args.size() < 4 || args.size() > 7) return {Status::RedisParseErr, errWrongNumOfArguments};
+
+      migrate_action_ = MigrateAction::kStart;
 
       Status s = CommandTable::ParseSlotRanges(args_[2], slot_ranges_);
       if (!s.IsOK()) {
@@ -183,6 +198,8 @@ class CommandClusterX : public Commander {
             }
             sync_migrate_timeout_ = *parse_result;
           }
+        } else if (sync_flag == "dtsmode") {
+          dts_mode_ = true;
         } else {
           return {Status::RedisParseErr, "Invalid sync flag"};
         }
@@ -276,18 +293,50 @@ class CommandClusterX : public Commander {
     } else if (subcommand_ == "myid") {
       *output = redis::BulkString(srv->cluster->GetMyId());
     } else if (subcommand_ == "migrate") {
-      if (sync_migrate_) {
-        sync_migrate_ctx_ = std::make_unique<SyncMigrateContext>(srv, conn, sync_migrate_timeout_);
-      }
-      // TODO: support multiple slot ranges
-      Status s = srv->cluster->MigrateSlotRange(slot_ranges_[0], dst_node_id_, sync_migrate_ctx_.get());
-      if (s.IsOK()) {
-        if (sync_migrate_) {
-          return {Status::BlockingCmd};
+      if (migrate_action_ == MigrateAction::kDTSComplete) {
+        // Handle DTSCOMPLETE
+        if (!srv->slot_migrator->IsMigrationInProgress()) {
+          return {Status::RedisExecErr, "No active migration"};
         }
-        *output = redis::RESP_OK;
-      } else {
+        if (!srv->slot_migrator->IsDTSMode()) {
+          return {Status::RedisExecErr, "Not in DTS mode"};
+        }
+        Status s = srv->slot_migrator->CompleteDTSMigration();
+        if (s.IsOK()) {
+          *output = redis::RESP_OK;
+        }
         return s;
+      } else if (migrate_action_ == MigrateAction::kDTSCancel) {
+        // Handle DTSCANCEL
+        if (!srv->slot_migrator->IsMigrationInProgress()) {
+          return {Status::RedisExecErr, "No active migration"};
+        }
+        if (!srv->slot_migrator->IsDTSMode()) {
+          return {Status::RedisExecErr, "Not in DTS mode"};
+        }
+        Status s = srv->slot_migrator->CancelDTSMigration();
+        if (s.IsOK()) {
+          *output = redis::RESP_OK;
+        }
+        return s;
+      } else {
+        // Handle start migration
+        if (sync_migrate_) {
+          sync_migrate_ctx_ = std::make_unique<SyncMigrateContext>(srv, conn, sync_migrate_timeout_);
+        }
+        if (dts_mode_) {
+          srv->slot_migrator->EnableDTSMode();
+        }
+        // TODO: support multiple slot ranges
+        Status s = srv->cluster->MigrateSlotRange(slot_ranges_[0], dst_node_id_, sync_migrate_ctx_.get());
+        if (s.IsOK()) {
+          if (sync_migrate_) {
+            return {Status::BlockingCmd};
+          }
+          *output = redis::RESP_OK;
+        } else {
+          return s;
+        }
       }
     } else {
       return {Status::RedisExecErr, "Invalid cluster command options"};
@@ -299,6 +348,12 @@ class CommandClusterX : public Commander {
   }
 
  private:
+  enum class MigrateAction {
+    kStart,
+    kDTSComplete,
+    kDTSCancel
+  };
+
   std::string subcommand_;
   std::string nodes_str_;
   std::string dst_node_id_;
@@ -308,6 +363,8 @@ class CommandClusterX : public Commander {
 
   bool sync_migrate_ = false;
   int sync_migrate_timeout_ = 0;
+  bool dts_mode_ = false;
+  MigrateAction migrate_action_ = MigrateAction::kStart;
   std::unique_ptr<SyncMigrateContext> sync_migrate_ctx_ = nullptr;
 };
 

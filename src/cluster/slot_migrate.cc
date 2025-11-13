@@ -198,12 +198,44 @@ void SlotMigrator::runMigrationProcess() {
       case SlotMigrationStage::kSnapshot: {
         auto s = sendSnapshot();
         if (s.IsOK()) {
-          current_stage_ = SlotMigrationStage::kWAL;
+          // After snapshot, decide next stage based on DTS mode
+          if (dts_mode_) {
+            info("[migrate] Entering DTS sync stage for slot(s) {}", slot_range_.load().String());
+            current_stage_ = SlotMigrationStage::kDTSSync;
+          } else {
+            current_stage_ = SlotMigrationStage::kWAL;
+          }
         } else {
           error("[migrate] Failed to send snapshot of slot(s) {}. Error: {}", slot_range_.load().String(), s.Msg());
           current_stage_ = SlotMigrationStage::kFailed;
           resumeSyncCtx(s);
         }
+        break;
+      }
+      case SlotMigrationStage::kDTSSync: {
+        // Check if migration should be stopped (cancelled)
+        if (stop_migration_) {
+          info("[migrate] DTS migration cancelled for slot(s) {}", slot_range_.load().String());
+          current_stage_ = SlotMigrationStage::kFailed;
+          break;
+        }
+
+        // Continuously sync incremental WAL
+        auto s = syncDTSWAL();
+        if (!s.IsOK()) {
+          error("[migrate] Failed to sync DTS WAL for slot(s) {}. Error: {}", slot_range_.load().String(), s.Msg());
+          current_stage_ = SlotMigrationStage::kFailed;
+          resumeSyncCtx(s);
+          break;
+        }
+
+        // Check if completion is requested
+        if (IsDTSCompleteRequested()) {
+          info("[migrate] DTS completion requested, switching to final WAL sync for slot(s) {}",
+               slot_range_.load().String());
+          current_stage_ = SlotMigrationStage::kWAL;
+        }
+        // Otherwise, continue in DTS sync stage (loop will continue)
         break;
       }
       case SlotMigrationStage::kWAL: {
@@ -473,6 +505,10 @@ void SlotMigrator::clean() {
   dst_fd_.Reset();
   slot_range_ = {-1, -1};
   SetStopMigrationFlag(false);
+  
+  // Reset DTS mode flags
+  dts_mode_ = false;
+  dts_complete_requested_ = false;
 }
 
 Status SlotMigrator::authOnDstNode(int sock_fd, const std::string &password) {
@@ -1436,4 +1472,75 @@ Status SlotMigrator::migrateIncrementalDataByRawKV(uint64_t end_seq, BatchSender
 
   // send the remaining data
   return sendMigrationBatch(batch_sender);
+}
+
+Status SlotMigrator::syncDTSWAL() {
+  // Sync incremental WAL during DTS mode
+  uint64_t current_seq = storage_->GetDB()->GetLatestSequenceNumber();
+  
+  if (current_seq <= wal_begin_seq_) {
+    // No new data to sync, just sleep a bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return Status::OK();
+  }
+
+  Status s;
+  if (migration_type_ == MigrationType::kRedisCommand) {
+    // Use redis command migration
+    s = migrateIncrementData(nullptr, current_seq);
+    if (!s.IsOK()) {
+      return {Status::NotOK, fmt::format("failed to sync DTS WAL: {}", s.Msg())};
+    }
+  } else if (migration_type_ == MigrationType::kRawKeyValue) {
+    // Use raw key-value migration
+    BatchSender batch_sender(*dst_fd_, migrate_batch_size_bytes_, migrate_batch_bytes_per_sec_);
+    s = migrateIncrementalDataByRawKV(current_seq, &batch_sender);
+    if (!s.IsOK()) {
+      return {Status::NotOK, fmt::format("failed to sync DTS WAL: {}", s.Msg())};
+    }
+  } else {
+    return {Status::NotOK, "failed to sync DTS WAL: unsupported migration type"};
+  }
+
+  // Update wal_begin_seq_ for next iteration
+  wal_begin_seq_ = current_seq;
+  info("[migrate] DTS WAL synced to seq: {}", current_seq);
+  
+  return Status::OK();
+}
+
+Status SlotMigrator::CompleteDTSMigration() {
+  if (!IsDTSMode()) {
+    return {Status::NotOK, "Not in DTS mode"};
+  }
+  if (!IsMigrationInProgress()) {
+    return {Status::NotOK, "No active migration"};
+  }
+  if (current_stage_ != SlotMigrationStage::kDTSSync) {
+    return {Status::NotOK, "Not in DTS sync state"};
+  }
+
+  // Set the completion flag
+  dts_complete_requested_ = true;
+  info("[migrate] DTS completion requested for slot(s) {}", slot_range_.load().String());
+  
+  return Status::OK();
+}
+
+Status SlotMigrator::CancelDTSMigration() {
+  if (!IsDTSMode()) {
+    return {Status::NotOK, "Not in DTS mode"};
+  }
+  if (!IsMigrationInProgress()) {
+    return {Status::NotOK, "No active migration"};
+  }
+
+  // Reset DTS flags and stop migration
+  dts_mode_ = false;
+  dts_complete_requested_ = false;
+  SetStopMigrationFlag(true);
+  
+  info("[migrate] DTS migration cancelled for slot(s) {}", slot_range_.load().String());
+  
+  return Status::OK();
 }

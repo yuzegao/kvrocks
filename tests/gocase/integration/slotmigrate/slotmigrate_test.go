@@ -1385,3 +1385,165 @@ func TestSlotRangeMigrate(t *testing.T) {
 	})
 
 }
+
+// DTS mode integration test: full flow (start, incremental writes, complete)
+func TestDTSModeComplete(t *testing.T) {
+    ctx := context.Background()
+
+    srv0 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb0 := srv0.NewClient()
+    defer func() { require.NoError(t, rdb0.Close()) }()
+    defer func() { srv0.Close() }()
+    id0 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODEID", id0).Err())
+
+    srv1 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb1 := srv1.NewClient()
+    defer func() { require.NoError(t, rdb1.Close()) }()
+    defer func() { srv1.Close() }()
+    id1 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", id1).Err())
+
+    clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id0, srv0.Host(), srv0.Port())
+    clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+    // Prefer raw-key-value type for DTS mode
+    require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", "raw-key-value").Err())
+
+    slot := 120
+    for i := 0; i < 20; i++ {
+        require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+    }
+
+    // Start migration in DTS mode
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1, "dtsmode").Val())
+    waitForMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
+
+    // Write increments during DTS sync
+    for i := 20; i < 40; i++ {
+        require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+    }
+    time.Sleep(300 * time.Millisecond)
+
+    // Request completion
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "dtscomplete").Val())
+    waitForMigrateState(t, rdb0, slot, SlotMigrationStateSuccess)
+    waitForImportState(t, rdb1, slot, SlotImportStateSuccess)
+
+    // After success, source writes to the slot should return MOVED
+    require.Contains(t, rdb0.LPush(ctx, util.SlotTable[slot], 1000).Err().Error(), "MOVED")
+}
+
+// DTS mode integration test: cancel flow
+func TestDTSModeCancel(t *testing.T) {
+    ctx := context.Background()
+
+    srv0 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb0 := srv0.NewClient()
+    defer func() { require.NoError(t, rdb0.Close()) }()
+    defer func() { srv0.Close() }()
+    id0 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODEID", id0).Err())
+
+    srv1 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb1 := srv1.NewClient()
+    defer func() { require.NoError(t, rdb1.Close()) }()
+    defer func() { srv1.Close() }()
+    id1 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", id1).Err())
+
+    clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id0, srv0.Host(), srv0.Port())
+    clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+    require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", "raw-key-value").Err())
+
+    slot := 121
+    for i := 0; i < 10; i++ {
+        require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+    }
+
+    // Start DTS mode
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1, "dtsmode").Val())
+    waitForMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
+
+    // Cancel DTS migration
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "dtscancel").Val())
+    waitForMigrateState(t, rdb0, slot, SlotMigrationStateFailed)
+
+    // After cancel, source writes remain normal, no MOVED
+    require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], 100).Err())
+}
+
+// DTS action error coverage: no active migration, non-DTS mode
+func TestDTSModeActionErrors(t *testing.T) {
+    ctx := context.Background()
+
+    srv0 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb0 := srv0.NewClient()
+    defer func() { require.NoError(t, rdb0.Close()) }()
+    defer func() { srv0.Close() }()
+    id0 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODEID", id0).Err())
+
+    srv1 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb1 := srv1.NewClient()
+    defer func() { require.NoError(t, rdb1.Close()) }()
+    defer func() { srv1.Close() }()
+    id1 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", id1).Err())
+
+    clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id0, srv0.Host(), srv0.Port())
+    clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+    // 1) DTSCOMPLETE with no active migration
+    require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "dtscomplete").Err(), "No active migration")
+
+    // 2) DTSCOMPLETE/DTSCANCEL in non-DTS mode
+    slot := 122
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1).Val())
+    waitForMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
+    require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "dtscomplete").Err(), "Not in DTS mode")
+    require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "dtscancel").Err(), "Not in DTS mode")
+}
+
+// DTS action error coverage: request completion not in DTS sync state
+func TestDTSModeCompleteNotInSync(t *testing.T) {
+    ctx := context.Background()
+
+    srv0 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb0 := srv0.NewClient()
+    defer func() { require.NoError(t, rdb0.Close()) }()
+    defer func() { srv0.Close() }()
+    id0 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODEID", id0).Err())
+
+    srv1 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+    rdb1 := srv1.NewClient()
+    defer func() { require.NoError(t, rdb1.Close()) }()
+    defer func() { srv1.Close() }()
+    id1 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", id1).Err())
+
+    clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id0, srv0.Host(), srv0.Port())
+    clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
+    require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+    require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+    require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", "raw-key-value").Err())
+
+    slot := 123
+    // Prepare large data to prolong snapshot stage for stability
+    for i := 0; i < 20000; i++ {
+        require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+    }
+
+    require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1, "dtsmode").Val())
+    // Immediately request completion; expected not in DTS sync stage
+    require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "dtscomplete").Err(), "sync state")
+}

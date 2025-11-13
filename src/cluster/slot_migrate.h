@@ -52,7 +52,7 @@ enum class MigrationType {
 
 enum class MigrationState { kNone = 0, kStarted, kSuccess, kFailed };
 
-enum class SlotMigrationStage { kNone, kStart, kSnapshot, kWAL, kSuccess, kFailed, kClean };
+enum class SlotMigrationStage { kNone, kStart, kSnapshot, kWAL, kSuccess, kFailed, kClean, kDTSSync };
 
 enum class KeyMigrationResult { kMigrated, kExpired, kUnderlyingStructEmpty };
 
@@ -110,6 +110,13 @@ class SlotMigrator : public redis::Database {
   void GetMigrationInfo(std::string *info) const;
   void CancelSyncCtx();
 
+  // DTS mode methods
+  void EnableDTSMode() { dts_mode_ = true; }
+  bool IsDTSMode() const { return dts_mode_; }
+  Status CompleteDTSMigration();
+  Status CancelDTSMigration();
+  bool IsDTSCompleteRequested() const { return dts_complete_requested_; }
+
  private:
   void loop();
   void runMigrationProcess();
@@ -117,6 +124,7 @@ class SlotMigrator : public redis::Database {
   Status startMigration();
   Status sendSnapshot();
   Status syncWAL();
+  Status syncDTSWAL();
   Status finishSuccessfulMigration();
   Status finishFailedMigration();
   void clean();
@@ -202,6 +210,10 @@ class SlotMigrator : public redis::Database {
   std::atomic<bool> stop_migration_ = false;  // if is true migration will be stopped but the thread won't be destroyed
   const rocksdb::Snapshot *slot_snapshot_ = nullptr;
   uint64_t wal_begin_seq_ = 0;
+
+  // DTS mode flags
+  std::atomic<bool> dts_mode_ = false;
+  std::atomic<bool> dts_complete_requested_ = false;
 
   std::mutex blocking_mutex_;
   SyncMigrateContext *blocking_context_ = nullptr;
